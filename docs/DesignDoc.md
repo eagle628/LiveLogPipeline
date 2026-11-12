@@ -266,3 +266,54 @@ public static class LiveLogLoggingBuilderExtensions
         Action<LiveLogOptions>? configure = null);
 }
 ```
+
+## DataFlow検討
+
+```mermaid
+flowchart TD
+    subgraph Producers ["各スレッド (App / UI / Background)"]
+        Logger["ILogger&lt;T&gt;.Log(...)"]
+        ScopeCtx["AsyncLocal / DI Scope Context"]
+    end
+
+    subgraph Ingestion ["1. Ingestion (Lock-Free / Zero-Alloc Filter)"]
+        PreFilter{"事前フィルタ<br/>MinLogLevel &amp; IncludedEventIds"}
+        SeqGen["SequenceId 採番 (Interlocked)<br/>&amp; LogEntry 構築"]
+        Channel[("System.Threading.Channels<br/>(Bounded / DropOldest)")]
+    end
+
+    subgraph Consumer ["2. Single Background Consumer"]
+        Worker["LiveLogPipelineManager<br/>(Background Worker Loop)"]
+        CustomFilter{"カスタム Filter 評価<br/>(Func&lt;LogEntry, bool&gt;)"}
+    end
+
+    subgraph Pipelines ["3. Storage &amp; Batching (Root &amp; Scoped)"]
+        RootPipe["Root Pipeline (Singleton)<br/>リングバッファ + バッチ集約"]
+        ScopedPipe["Scoped Pipeline (DI Scope)<br/>リングバッファ + バッチ集約"]
+    end
+
+    subgraph Delivery ["4. Delivery (Push &amp; Pull)"]
+        FastPath["Fast パス: ArrayPool 貸出<br/>LogBatchReceivedFast(ReadOnlySpan)"]
+        SafePath["Safe パス: 独立配列確保<br/>LogBatchReceived(LogBatchEventArgs)"]
+        PullPath["Pull: GetSnapshot() / CopyTo()"]
+    end
+
+    Logger --> PreFilter
+    PreFilter -- "対象外 (即破棄)" --> Drop((Drop))
+    PreFilter -- "通過" --> SeqGen
+    ScopeCtx -. "発行元の ScopeId を付与" .-> SeqGen
+    SeqGen -- "TryWrite (非ブロッキング)" --> Channel
+
+    Channel --> Worker
+    Worker --> CustomFilter
+    CustomFilter -- "通過" --> RootPipe
+    CustomFilter -- "ScopeId 一致時のみ" --> ScopedPipe
+
+    RootPipe & ScopedPipe --> FastPath
+    RootPipe & ScopedPipe --> SafePath
+    RootPipe & ScopedPipe -. "オンデマンド取得" .-> PullPath
+```
+
+- Note
+  - ScopeIDはPublicAPIとしては公開しないように決めているが、LoggerがSingltonになるようになっているので、どうしてもScope情報が消えてしまう。この情報を受け渡す構造が必要であり、今回は`AsyncLocal<T>`を使う。
+  - `AsyncLocal<T>`はライブラリ向けのやべえ機能なので[TIPS](note/async-local-tips.md)にメモを入れた
