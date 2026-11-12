@@ -20,8 +20,8 @@ Second
 
 - `Microsoft.Extensions.Logging` の `ILogger` からのログデータを直近 N 件までインメモリに保管する。
   - バッファ上限（MaxCapacity）超過時は、最も古いエントリから自動破棄（DropOldest 循環）する。
-- 書き込みの Lock は厳禁。ロックフリー指向の設計とする。
-  - `ILogger.Log` 呼び出しはロックフリー（`System.Threading.Channels` の非ブロッキング書き込み）を前提とし、呼び出し元スレッドを一切ブロックしない。
+- 書き込みはロックフリー指向の設計とする。ただし初期フェーズでは厳密なロックフリーは必須としない（テスト整備後に最適化する）。
+  - `ILogger.Log` は `System.Threading.Channels` の `TryWrite`（待機を伴わない書き込み）を用い、呼び出し元スレッドを待機でブロックしない。
   - 初期フェーズでは実装コストと安全性を優先し、内部バッファ（Channel）経由の単一 Consumer 集約パイプライン構成とする。
   - 将来的な最適化（$2^n$ シーケンス配列直書き）への差し替えを見据え、外部インターフェース（`ILiveLogPipeline`）は内部構造に依存しない設計とする。
 - 保持する`LogEntry`レコードは値型想定
@@ -32,18 +32,22 @@ Second
   - **Push（リアルタイム配信）**:
     - 定周期バッチ集約（Periodic Batching / Throttle: 最大遅延時間 N ms または 最大保持件数 M 件に達したらフラッシュ）を基本とし、オプションとして `Debounce`（ログ静止時のみフラッシュ）への切り替えを可能とする
     - 時間経過やタイマー駆動の処理は、決定論的かつ高速な単体テストを実現するため、すべて `TimeProvider`（.NET 8+）経由で実行すること。
+      - `TimeProvider` は LiveLogPipeline のコンストラクタ注入で受け取る（DI 既定は `TimeProvider.System`、テストでは `FakeTimeProvider` に差し替える）。
+  - **購読者（イベントハンドラ）の契約**:
+    - ハンドラは Consumer スレッド上で同期的に呼び出されるため、高速であること。UI への反映は `Dispatcher` へ受け渡すだけにする。
+    - ハンドラは購読者ごとに try/catch で呼び出し、1 つの例外が Worker や他の購読者を停止させない。
+    - ハンドラが遅い場合も Producer はブロックされず、Channel の DropOldest により古いログが失われる。
+    - Dispose 時は Channel を Complete し、Consumer の終了を待つ。以降はイベントを発火しない。
   - **Push における取り出しメモリ方針**:
     - Mode A (Delta): 直前の通知からの更新分のみを取得
       - Fast パス (Zero-Allocation):
         - コールバックに `ReadOnlySpan<LogEntry>` を使用し、非同期持ち出しを言語仕様（ref struct）で物理的に遮断。
         - 通知用バッファは `ArrayPool<LogEntry>` を活用し、イベント終了直後にライブラリが自動回収する。
-      - ~~Safe パス (Async/Dispatcher 互換)~~:
-        - ~~非同期処理や Dispatcher.InvokeAsync への安全な引き渡しを目的とし、バッチごとの独立配列（`LogEntry[]` / `ReadOnlyMemory<LogEntry>`）生成を許容する。~~
-        - Safeパスについては、Pull側に統合
+      - Safe パス (Async/Dispatcher 互換):
+        - 非同期処理や Dispatcher.InvokeAsync への安全な引き渡しを目的とし、バッチごとの独立配列（`LogEntry[]` / `ReadOnlyMemory<LogEntry>`）生成を許容する。
     - Mode B (Snapshot): 通知時点のバッファ内全件を取得（低頻度な同期利用または明示的なスナップショット配列生成とする）。
   - **Pull（オンデマンド取得）におけるメモリ方針**:
     - 手軽な取得用: 呼び出し時に新しいスナップショット配列を生成して返却（`LogEntry[] GetSnapshot()`）。
-      - 非同期処理や Dispatcher.InvokeAsync への安全な引き渡しを目的とし、バッチごとの独立配列（`LogEntry[]`）生成を許容する。
     - ゼロアロケーション用: 呼び出し側が渡したバッファへ直接書き込み（`int CopyTo(Span<LogEntry> destination)`）。
 
 ### フィルタリングと開発者体験 (Filtering & DX)
@@ -61,7 +65,7 @@ Second
 
 - **LiveLogPipeline の責務**:
   - インメモリバッファの容量（MaxCapacity = N）を厳密に保証し、超過時は DropOldest で自動破棄する。
-  - 外部への Push 通知は設定された配信モード（Delta または Snapshot）に従って安全にディスパッチし、自身のメモリ使用量を一定（O(1)）に保つ。
+  - 外部への Push 通知は設定された配信モード（Delta または Snapshot）に従って安全にディスパッチし、LiveLogPipeline 内部のメモリ量を、ログ流量に依存せず設定上限（MaxCapacity・Channel 容量・バッチ上限）で一定に保つ。
 - **UI / Consumer の責務**:
   - UI 側の表示リスト（`ObservableCollection` 等）の肥大化を防ぐため、UI 側での最大表示件数（TrimExcess）の制御は ViewModel / UI 側の責務とする。
   - （例: UI 側でバッチ差分を追加後、`while (Logs.Count > MaxViewCount) Logs.RemoveAt(0);` を行う運用を標準とする）
@@ -73,6 +77,7 @@ Second
 - **Scoped パイプライン**:
   - 特定の画面（Window / Tab）や業務セッションの生存期間に連動する `IScopedLiveLogPipeline` を提供すること。
   - スコープの Dispose と連動して、内部バッファおよび購読が自動的に解放・クリーンアップされること。
+  - 生成時に `AsyncLocal` へ自身の ScopeId を設定し、Dispose 時に生成前の値（ネスト時は親スコープ、なければ null）へ戻す。
 - **ログのルーティング**:
   - スコープ内で発生したログは、原則として「Scoped パイプライン」と「Root パイプライン」の双方に安全に配信されること。
 
@@ -245,11 +250,12 @@ public enum BatchMode
 
 - note
   - `Filter`の使用ケース
-    1. 「特定のカテゴリ（クラス）だけログレベルを下げる」動的制御
+    1. 「特定のカテゴリ（クラス）のログを追加で除外する」動的制御（`MinLogLevel` を通過したログの絞り込みのみ可能。レベルを下げて通すことはできない）
     2. 特定メッセージのノイズ除去（ブラックリスト / 無視）
     3. 特定の例外（Exception）型に応じた選別
     4. スレッドや実行コンテキストによる選別
   - ただし、ログごとの評価になるので十分に早い同期コードであることを前提にユーザ側に実装してもらう想定
+  - フィルタの適用順: ① 事前フィルタ（`MinLogLevel` → `IncludedEventIds`、Producer 側）→ ② カスタム `Filter`（Consumer 側）。後段は前段を通過したログのみ受け取り、絞り込みしかできない。
 
 ### HostExtensions
 
@@ -278,12 +284,12 @@ flowchart TD
 
     subgraph Ingestion ["1. Ingestion (Lock-Free / Zero-Alloc Filter)"]
         PreFilter{"事前フィルタ<br/>MinLogLevel &amp; IncludedEventIds"}
-        SeqGen["SequenceId 採番 (Interlocked)<br/>&amp; LogEntry 構築"]
+        SeqGen["LogEntry 構築<br/>(Timestamp 付与)"]
         Channel[("System.Threading.Channels<br/>(Bounded / DropOldest)")]
     end
 
     subgraph Consumer ["2. Single Background Consumer"]
-        Worker["LiveLogPipelineManager<br/>(Background Worker Loop)"]
+        Worker["LiveLogPipelineManager<br/>(Background Worker Loop)<br/>SequenceId 採番"]
         CustomFilter{"カスタム Filter 評価<br/>(Func&lt;LogEntry, bool&gt;)"}
     end
 
@@ -316,4 +322,8 @@ flowchart TD
 
 - Note
   - ScopeIDはPublicAPIとしては公開しないように決めているが、LoggerがSingltonになるようになっているので、どうしてもScope情報が消えてしまう。この情報を受け渡す構造が必要であり、今回は`AsyncLocal<T>`を使う。
+  - ScopePipeline の生成時に `AsyncLocal` へ Set し、Dispose で直前の値（なければ null）に戻す。注意点:
+    - `Set` は呼び出し元の同期コンテキストで行う（async メソッド内の `Set` は呼び出し元へ伝わらない）。
+    - Dispose 後も、既に値を引き継いだ非同期フローには古い ScopeId が残り得るため、Consumer は Dispose 済み Scoped パイプライン宛てのログを無視する。
+  - SequenceId は Producer 側の `Interlocked` ではなく、単一 Consumer が dequeue 後に採番する。採番とChannel書き込みが非アトミックなため、Producer 側採番では Channel 内の順序と SequenceId 順が入れ替わり得るのを避けるため。
   - `AsyncLocal<T>`はライブラリ向けのやべえ機能なので[TIPS](note/async-local-tips.md)にメモを入れた
