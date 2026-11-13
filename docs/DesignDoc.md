@@ -326,7 +326,7 @@ flowchart TD
 
 - **AsyncLocal の限界**: 同一 UI スレッド上で複数の Window / Tab が並存すると、後から生成したスコープの値が先のスコープのイベントハンドラ由来のログにも適用され、非 LIFO 順の Dispose で復元も崩れる。WPF の複数 Tab での動作を最優先で検証し、不十分なら `BeginScope` ベースまたは明示指定（ファクトリ経由の Logger）へ切り替える。
 - **登録と生成**: `AddLiveLogPipeline` が登録する対象（Provider、Root パイプライン、Worker は `IHostedService`）と Scoped パイプラインの生成手段（DI スコープ / ファクトリ）、Scoped 個別の Options の要否。ホスト起動前のログは Channel に溜める。
-- **Channel**: 容量の設定項目、`MaxCapacity` との関係、欠落件数のカウンタ公開の要否。
+- **Channel**: 初期実装は容量 100・`DropOldest` とする。Consumer が追いつかない場合は未処理の古いログが失われ、継続的な過負荷では欠落が続く。SequenceId は dequeue 後に採番するため、Channel で捨てられた件数は ID の欠番からは分からない。容量の設定項目、`MaxCapacity` との関係、欠落件数カウンタの公開要否は OPT として検討する。アプリ終了時は未処理分を破棄してよい。
 - **設定バインド**: appsettings.json セクションへのバインド方法と、`AddFilter<T>` に使う Provider 型 / エイリアス名。`IncludedEventIds` は `EventId.Id` のみで判定する。
 - **内部型**: Channel 用の内部ラッパー（ScopeId 付き、SequenceId 未採番）。
 - **その他**: `ILiveLogPipeline.Dispose` を Root に公開してよいか（Scoped のみに持たせる案あり）、`ManagedThreadId` は Producer スレッドで取得する、Safe パスの配列は購読者がいない場合は生成しない。
