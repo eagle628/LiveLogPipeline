@@ -45,17 +45,18 @@ Second
         - 通知用バッファは `ArrayPool<LogEntry>` を活用し、イベント終了直後にライブラリが自動回収する。
       - Safe パス (Async/Dispatcher 互換):
         - 非同期処理や Dispatcher.InvokeAsync への安全な引き渡しを目的とし、バッチごとの独立配列（`LogEntry[]` / `ReadOnlyMemory<LogEntry>`）生成を許容する。
-    - Mode B (Snapshot): 通知時点のバッファ内全件を取得（低頻度な同期利用または明示的なスナップショット配列生成とする）。
+    - Mode B (Snapshot): 初版ではイベント配信は Delta のみとし、全件取得は Pull の `GetSnapshot()` に統合する（Options に配信モード項目は設けない）。
   - **Pull（オンデマンド取得）におけるメモリ方針**:
     - 手軽な取得用: 呼び出し時に新しいスナップショット配列を生成して返却（`LogEntry[] GetSnapshot()`）。
-    - ゼロアロケーション用: 呼び出し側が渡したバッファへ直接書き込み（`int CopyTo(Span<LogEntry> destination)`）。
+    - ゼロアロケーション用: 呼び出し側が渡したバッファへ直接書き込み（`int CopyTo(Span<LogEntry> destination)`）。destination が不足する場合は最新側の `destination.Length` 件を時系列順に書き込む。
+    - Pull は書き込みと競合しても途中状態を返さない一貫したスナップショットとする（同期方式は実装時に確定。短い排他区間は許容する）。
 
 ### フィルタリングと開発者体験 (Filtering & DX)
 
 - ログのフィルタリングが可能となり、インメモリに保存する対象範囲を指定できること（`CategoryName`, `LogLevel`, `EventId` 等）。
 - 開発用ログとユーザー向けログを別々の `ILogger` インスタンスに分けて実装しなくてよいこと。
   - 単一の `ILogger<T>` から発行されたログに対し、`EventId` 等のタグを用いてインメモリ保存対象を透過的に選別できること。
-- `Microsoft.Extensions.Logging` の Provider 独立フィルタ機能および本ライブラリ固有の Options（`EventIdFilter` 等）により、ファイル出力（FileLogger）など他のログプロバイダの設定や動作と相互に干渉・依存しないこと。
+- `Microsoft.Extensions.Logging` の Provider 独立フィルタ機能および本ライブラリ固有の Options（`IncludedEventIds` 等）により、ファイル出力（FileLogger）など他のログプロバイダの設定や動作と相互に干渉・依存しないこと。
 
 ### 構成・設定 (Configuration)
 
@@ -65,9 +66,10 @@ Second
 
 - **LiveLogPipeline の責務**:
   - インメモリバッファの容量（MaxCapacity = N）を厳密に保証し、超過時は DropOldest で自動破棄する。
-  - 外部への Push 通知は設定された配信モード（Delta または Snapshot）に従って安全にディスパッチし、LiveLogPipeline 内部のメモリ量を、ログ流量に依存せず設定上限（MaxCapacity・Channel 容量・バッチ上限）で一定に保つ。
+  - 外部への Push 通知は Delta 配信に従って安全にディスパッチし、LiveLogPipeline 内部のメモリ量を、ログ流量に依存せず設定上限（MaxCapacity・Channel 容量・バッチ上限）で一定に保つ。
+  - 「低アロケーション」の対象は配信側（バッチ・Fast パス）とする。Producer 側の `Message` フォーマットによる割り当ては避けられない。また `Exception` への参照はバッファ内で保持される。
 - **UI / Consumer の責務**:
-  - UI 側の表示リスト（`ObservableCollection` 等）の肥大化を防ぐため、UI 側での最大表示件数（TrimExcess）の制御は ViewModel / UI 側の責務とする。
+  - UI 側の表示リスト（`ObservableCollection` 等）の肥大化を防ぐため、UI 側での最大表示件数の制御は ViewModel / UI 側の責務とする。
   - （例: UI 側でバッチ差分を追加後、`while (Logs.Count > MaxViewCount) Logs.RemoveAt(0);` を行う運用を標準とする）
 
 ### サービスライフタイムとスコープ分離要件
@@ -97,7 +99,7 @@ public readonly record struct LogEntry(
     int ManagedThreadId = 0);
 ```
 
-`long SequenceId`については、ユーザには不要ではあるが、内部実装上必須であることと、ユーザに不利になる要素がほぼないことからPublicにする。特にInternalにするまでの必要性はないと考える。
+`long SequenceId`は、Consumer が dequeue 時に採番する単調増加の一意な連番とする（欠落・フィルタ除外により連続は保証しない）。UI の行キー、Pull と Push 差分の重複排除（`SequenceId > last`）、DropOldest による欠落検知に利用できるため Public にする。Root と Scoped パイプラインは同一の SequenceId を共有する。また将来の配列直書き実装でも内部で必要となる。
 
 ### `ILiveLogPipeline`
 
@@ -205,7 +207,8 @@ public sealed class LiveLogOptions
     // =========================================================================
 
     /// <summary>
-    /// バッチ通知を行う間隔（デフォルト: 100ms）。
+    /// バッチ通知を行う間隔（デフォルト: 100ms）。Debounce モードでは「ログ静止とみなす時間」として用い、
+    /// ログが途切れず続く場合も MaxBatchSize 到達時は強制的にフラッシュする。
     /// </summary>
     public TimeSpan FlushInterval { get; set; } = TimeSpan.FromMilliseconds(100);
 
@@ -234,11 +237,6 @@ public sealed class LiveLogOptions
     /// appsettings.json からの [ 1001, 1002 ] バインドに対応します。
     /// </summary>
     public HashSet<int>? IncludedEventIds { get; set; }
-
-    /// <summary>
-    /// コードから柔軟にフィルタリングを行うための判定デリゲート（オプション）。
-    /// </summary>
-    public Func<LogEntry, bool>? Filter { get; set; }
 }
 
 public enum BatchMode
@@ -249,13 +247,11 @@ public enum BatchMode
 ```
 
 - note
-  - `Filter`の使用ケース
-    1. 「特定のカテゴリ（クラス）のログを追加で除外する」動的制御（`MinLogLevel` を通過したログの絞り込みのみ可能。レベルを下げて通すことはできない）
-    2. 特定メッセージのノイズ除去（ブラックリスト / 無視）
-    3. 特定の例外（Exception）型に応じた選別
-    4. スレッドや実行コンテキストによる選別
-  - ただし、ログごとの評価になるので十分に早い同期コードであることを前提にユーザ側に実装してもらう想定
-  - フィルタの適用順: ① 事前フィルタ（`MinLogLevel` → `IncludedEventIds`、Producer 側）→ ② カスタム `Filter`（Consumer 側）。後段は前段を通過したログのみ受け取り、絞り込みしかできない。
+  - カスタムの判定デリゲート（`Func<LogEntry, bool> Filter`）は初版では設けない。
+    - カテゴリ・ログレベル単位の制御は、MEL 標準の `AddFilter<LiveLogProvider>(...)` および `appsettings.json` の `Logging:<Provider>:LogLevel` で行える。
+    - 本ライブラリの Options は、MEL 標準では扱えない `EventId` による絞り込み（`IncludedEventIds`）と `MinLogLevel` のみを持つ。
+    - 例外型・スレッド等による選別の要望が出た時点で、`(Category, LogLevel, EventId)` を入力とする軽量なデリゲートとして追加を検討する。
+  - フィルタの適用順: MEL 標準フィルタ（Provider 別の `AddFilter` / `LogLevel` 設定）→ `MinLogLevel` → `IncludedEventIds`（いずれも Producer 側）。
 
 ### HostExtensions
 
@@ -284,13 +280,12 @@ flowchart TD
 
     subgraph Ingestion ["1. Ingestion (Lock-Free / Zero-Alloc Filter)"]
         PreFilter{"事前フィルタ<br/>MinLogLevel &amp; IncludedEventIds"}
-        SeqGen["LogEntry 構築<br/>(Timestamp 付与)"]
+        SeqGen["内部エントリ構築<br/>(Timestamp / ScopeId 付与、SequenceId は未採番)"]
         Channel[("System.Threading.Channels<br/>(Bounded / DropOldest)")]
     end
 
     subgraph Consumer ["2. Single Background Consumer"]
         Worker["LiveLogPipelineManager<br/>(Background Worker Loop)<br/>SequenceId 採番"]
-        CustomFilter{"カスタム Filter 評価<br/>(Func&lt;LogEntry, bool&gt;)"}
     end
 
     subgraph Pipelines ["3. Storage &amp; Batching (Root &amp; Scoped)"]
@@ -311,9 +306,8 @@ flowchart TD
     SeqGen -- "TryWrite (非ブロッキング)" --> Channel
 
     Channel --> Worker
-    Worker --> CustomFilter
-    CustomFilter -- "通過" --> RootPipe
-    CustomFilter -- "ScopeId 一致時のみ" --> ScopedPipe
+    Worker --> RootPipe
+    Worker -- "ScopeId 一致時のみ" --> ScopedPipe
 
     RootPipe & ScopedPipe --> FastPath
     RootPipe & ScopedPipe --> SafePath
@@ -321,9 +315,18 @@ flowchart TD
 ```
 
 - Note
-  - ScopeIDはPublicAPIとしては公開しないように決めているが、LoggerがSingltonになるようになっているので、どうしてもScope情報が消えてしまう。この情報を受け渡す構造が必要であり、今回は`AsyncLocal<T>`を使う。
+  - ScopeIDはPublicAPIとしては公開しないように決めているが、LoggerがSingletonになるようになっているので、どうしてもScope情報が消えてしまう。この情報を受け渡す構造が必要であり、今回は`AsyncLocal<T>`を使う。
   - ScopePipeline の生成時に `AsyncLocal` へ Set し、Dispose で直前の値（なければ null）に戻す。注意点:
     - `Set` は呼び出し元の同期コンテキストで行う（async メソッド内の `Set` は呼び出し元へ伝わらない）。
     - Dispose 後も、既に値を引き継いだ非同期フローには古い ScopeId が残り得るため、Consumer は Dispose 済み Scoped パイプライン宛てのログを無視する。
   - SequenceId は Producer 側の `Interlocked` ではなく、単一 Consumer が dequeue 後に採番する。採番とChannel書き込みが非アトミックなため、Producer 側採番では Channel 内の順序と SequenceId 順が入れ替わり得るのを避けるため。
   - `AsyncLocal<T>`はライブラリ向けのやべえ機能なので[TIPS](note/async-local-tips.md)にメモを入れた
+
+### 実装時に確定する事項（未決）
+
+- **AsyncLocal の限界**: 同一 UI スレッド上で複数の Window / Tab が並存すると、後から生成したスコープの値が先のスコープのイベントハンドラ由来のログにも適用され、非 LIFO 順の Dispose で復元も崩れる。WPF の複数 Tab での動作を最優先で検証し、不十分なら `BeginScope` ベースまたは明示指定（ファクトリ経由の Logger）へ切り替える。
+- **登録と生成**: `AddLiveLogPipeline` が登録する対象（Provider、Root パイプライン、Worker は `IHostedService`）と Scoped パイプラインの生成手段（DI スコープ / ファクトリ）、Scoped 個別の Options の要否。ホスト起動前のログは Channel に溜める。
+- **Channel**: 容量の設定項目、`MaxCapacity` との関係、欠落件数のカウンタ公開の要否。
+- **設定バインド**: appsettings.json セクションへのバインド方法と、`AddFilter<T>` に使う Provider 型 / エイリアス名。`IncludedEventIds` は `EventId.Id` のみで判定する。
+- **内部型**: Channel 用の内部ラッパー（ScopeId 付き、SequenceId 未採番）。
+- **その他**: `ILiveLogPipeline.Dispose` を Root に公開してよいか（Scoped のみに持たせる案あり）、`ManagedThreadId` は Producer スレッドで取得する、Safe パスの配列は購読者がいない場合は生成しない。
