@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 
 namespace LiveLogPipeline.Internal;
 
+[ProviderAlias("LiveLog")]
 internal sealed class LiveLogLoggerProvider : ILoggerProvider
 {
     private readonly LiveLogRouter _router;
