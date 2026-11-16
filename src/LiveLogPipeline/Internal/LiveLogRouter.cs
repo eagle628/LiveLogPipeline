@@ -18,7 +18,7 @@ internal sealed class LiveLogRouter : IDisposable
         _buffer = Channel.CreateBounded<LogEnvelope>(new BoundedChannelOptions(100)
         {
             FullMode = BoundedChannelFullMode.DropOldest,
-            singleReader = true,
+            SingleReader = true,
             SingleWriter = false,
         });
         _processingTask = Task.Run(() => ProcessBufferAsync(_stop.Token));
@@ -40,7 +40,7 @@ internal sealed class LiveLogRouter : IDisposable
     }
     public void Dispose()
     {
-        _buffer.Writer.TryComplete();
+        _ = _buffer.Writer.TryComplete();
         _stop.Cancel();
 
         try
