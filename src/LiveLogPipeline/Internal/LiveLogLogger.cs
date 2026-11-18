@@ -6,9 +6,9 @@ internal class LiveLogLogger : ILogger
 {
     private readonly string _categoryName;
     private readonly LiveLogRouter _router;
-    private readonly LiveLogOptions _options;
+    private readonly LiveLogPipelineOptions _options;
 
-    public LiveLogLogger(string categoryName, LiveLogRouter router, LiveLogOptions options)
+    public LiveLogLogger(string categoryName, LiveLogRouter router, LiveLogPipelineOptions options)
     {
         _categoryName = categoryName;
         _router = router;

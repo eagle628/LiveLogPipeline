@@ -2,7 +2,7 @@ using Microsoft.Extensions.Logging;
 
 namespace LiveLogPipeline;
 
-public class LiveLogOptions
+public class LiveLogPipelineOptions
 {
     public int MaxCapacity { get; set; } = 1024;
     public TimeSpan FlushInterval { get; set; } = TimeSpan.FromMilliseconds(100);

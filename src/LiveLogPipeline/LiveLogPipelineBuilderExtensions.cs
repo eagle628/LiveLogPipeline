@@ -20,10 +20,10 @@ public static class LiveLogPipelineBuilderExtensions
         builder.Services.TryAddEnumerable(ServiceDescriptor.Singleton<ILoggerProvider, LiveLogLoggerProvider>());
         
         // Register the provider options for LiveLogLoggerProvider
-        LoggerProviderOptions.RegisterProviderOptions<LiveLogOptions, LiveLogLoggerProvider>(builder.Services);
+        LoggerProviderOptions.RegisterProviderOptions<LiveLogPipelineOptions, LiveLogLoggerProvider>(builder.Services);
         
         // Coinfguration validation for LiveLogOptions
-        _ = builder.Services.AddOptions<LiveLogOptions>()
+        _ = builder.Services.AddOptions<LiveLogPipelineOptions>()
         // TODO: Consider grouping option validation in the options class or creating a dedicated class for it.
                         .Validate(options => options.MaxCapacity > 0, "MaxCapacity must be greater than 0")
                         .Validate(options => options.FlushInterval > TimeSpan.Zero, "FlushInterval must be greater than 0")
@@ -32,7 +32,7 @@ public static class LiveLogPipelineBuilderExtensions
         return builder;
     }
 
-    public static ILoggingBuilder AddLiveLogPipeline(this ILoggingBuilder builder, Action<LiveLogOptions> configure)
+    public static ILoggingBuilder AddLiveLogPipeline(this ILoggingBuilder builder, Action<LiveLogPipelineOptions> configure)
     {
         _ = builder.AddLiveLogPipeline();
         _ = builder.Services.Configure(configure);

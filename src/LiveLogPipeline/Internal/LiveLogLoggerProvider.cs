@@ -8,9 +8,9 @@ namespace LiveLogPipeline.Internal;
 internal sealed class LiveLogLoggerProvider : ILoggerProvider
 {
     private readonly LiveLogRouter _router;
-    private readonly LiveLogOptions _options;
+    private readonly LiveLogPipelineOptions _options;
     private readonly ConcurrentDictionary<string, ILogger> _loggers;
-    public LiveLogLoggerProvider(LiveLogRouter router, IOptions<LiveLogOptions> options)
+    public LiveLogLoggerProvider(LiveLogRouter router, IOptions<LiveLogPipelineOptions> options)
     {
         _router = router;
         _options = options.Value;
