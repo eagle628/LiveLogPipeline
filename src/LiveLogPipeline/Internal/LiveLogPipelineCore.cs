@@ -4,19 +4,20 @@ namespace LiveLogPipeline.Internal;
 
 internal sealed class LiveLogPipelineCore : ILiveLogPipeline, IDisposable
 {
+    private readonly Lock _lock;
     private readonly LogEntry[] _buffer;
     private int _count;
-    private int _capFlag;
     private readonly int _capacity;
     private readonly int _mask;
     private int _top;
     public LiveLogPipelineCore()
     {
+        _lock = new Lock();
         //TODO: Make the buffer size configurable in the future
         int capacity = 1024;
         _capacity = capacity;
         _mask = capacity - 1;
-        _top = _mask;
+        _top = 0;
         _buffer = new LogEntry[capacity];
         _count = 0;
     }
@@ -24,13 +25,9 @@ internal sealed class LiveLogPipelineCore : ILiveLogPipeline, IDisposable
     {
         get
         {
-            if (Volatile.Read(ref _capFlag) == 0)
+            lock (_lock)
             {
-                return Volatile.Read(ref _count) & _mask;
-            }
-            else
-            {
-                return _capacity;
+                return _count;
             }
         }
     }
@@ -45,20 +42,68 @@ internal sealed class LiveLogPipelineCore : ILiveLogPipeline, IDisposable
         // Dispose resources if any
     }
 
-    public LogEntry[] GetSnapshot() => throw new NotImplementedException();
-    public int CopyTo(Span<LogEntry> destination) => throw new NotImplementedException();
+    public LogEntry[] GetSnapshot()
+    {
+        lock (_lock)
+        {
+            var snapshot = new LogEntry[_count];
+            _ = CopyToCore(snapshot);
+            return snapshot;
+        }
+    }
+
+    public int CopyTo(Span<LogEntry> destination)
+    {
+        lock (_lock)
+        {
+            if (destination.Length < _count)
+            {
+                throw new ArgumentException(
+                    "The destination is too small to contain the log snapshot.",
+                    nameof(destination));
+            }
+
+            return CopyToCore(destination);
+        }
+    }
+
+    private int CopyToCore(Span<LogEntry> destination)
+    {
+        if (_count == 0)
+        {
+            return 0;
+        }
+
+        if (_count < _capacity)
+        {
+            _buffer.AsSpan(0, _count).CopyTo(destination);
+            return _count;
+        }
+
+        if (_count == _capacity)
+        {
+            int firstLength = _capacity - _top;
+
+            _buffer.AsSpan(_top, firstLength).CopyTo(destination);
+            _buffer.AsSpan(0, _top).CopyTo(destination[firstLength..]);
+            return _count;
+        }
+
+        throw new InvalidOperationException("DevError:Unexpected buffer state.");
+    }
 
     public void Push(LogEntry logEntry)
     {
-        int top = Interlocked.Increment(ref _top);
-        int index = top & _mask;
-        _buffer[index] = logEntry;
-        int count = Interlocked.Increment(ref _count);
-        int capFlag = Volatile.Read(ref _capFlag);
-        // TODO: This is extremely unlikely, but _capFlag may not work correctly if roughly half of Int.MaxValue logs are added in a single run.
-        if (capFlag == 0 && count >= _capacity)
+        // OPT: consider SeqLock for single-writer and multiple-reader scenarios to reduce locking overhead
+        lock (_lock)
         {
-            _ = Interlocked.Exchange(ref _capFlag, 1);
+            _buffer[_top] = logEntry;
+            if (_count < _capacity)
+            {
+                _count++;
+            }
+            _top++;
+            _top &= _mask;
         }
     }
 }
