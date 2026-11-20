@@ -22,10 +22,11 @@ public static class LiveLogPipelineBuilderExtensions
         // Register the provider options for LiveLogLoggerProvider
         LoggerProviderOptions.RegisterProviderOptions<LiveLogPipelineOptions, LiveLogLoggerProvider>(builder.Services);
         
-        // Coinfguration validation for LiveLogOptions
+        // Configuration validation for LiveLogPipelineOptions
         _ = builder.Services.AddOptions<LiveLogPipelineOptions>()
         // TODO: Consider grouping option validation in the options class or creating a dedicated class for it.
-                        .Validate(options => options.MaxCapacity > 0, "MaxCapacity must be greater than 0")
+                        .Validate(options => options.MinimumRetainedEntryCount > 0, "Capacity must be greater than 0")
+                        .Validate(options => options.MinimumRetainedEntryCount <= LiveLogPipelineCore.MAX_MINIMUM_RETAINED_ENTRY_COUNT, "MinimumRetainedEntryCount must be less than or equal to 2^30")
                         .Validate(options => options.FlushInterval > TimeSpan.Zero, "FlushInterval must be greater than 0")
                         .Validate(options => options.MaxBatchSize > 0, "MaxBatchSize must be greater than 0");
 

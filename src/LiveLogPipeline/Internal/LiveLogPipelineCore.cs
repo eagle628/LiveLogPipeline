@@ -1,24 +1,24 @@
-using LiveLogPipeline;
+using System.Numerics;
+using Microsoft.Extensions.Options;
 
 namespace LiveLogPipeline.Internal;
 
 internal sealed class LiveLogPipelineCore : ILiveLogPipeline, IDisposable
 {
+    internal const int MAX_MINIMUM_RETAINED_ENTRY_COUNT = 1 << 30;
     private readonly Lock _lock;
     private readonly LogEntry[] _buffer;
     private int _count;
     private readonly int _capacity;
     private readonly int _mask;
     private int _top;
-    public LiveLogPipelineCore()
+    public LiveLogPipelineCore(IOptions<LiveLogPipelineOptions> options)
     {
         _lock = new Lock();
-        //TODO: Make the buffer size configurable in the future
-        int capacity = 1024;
-        _capacity = capacity;
-        _mask = capacity - 1;
+        _capacity = RoundUpToPowerOfTwo(options.Value.MinimumRetainedEntryCount);
+        _mask = _capacity - 1;
         _top = 0;
-        _buffer = new LogEntry[capacity];
+        _buffer = new LogEntry[_capacity];
         _count = 0;
     }
     public int Count
@@ -105,5 +105,10 @@ internal sealed class LiveLogPipelineCore : ILiveLogPipeline, IDisposable
             _top++;
             _top &= _mask;
         }
+    }
+    
+    private static int RoundUpToPowerOfTwo(int capacity)
+    {
+        return 1 << (BitOperations.Log2((uint)(capacity - 1)) + 1);
     }
 }

@@ -19,7 +19,7 @@ Second
 ### 蓄積・データ構造 (Ingestion & Storage)
 
 - `Microsoft.Extensions.Logging` の `ILogger` からのログデータを直近 N 件までインメモリに保管する。
-  - バッファ上限（MaxCapacity）超過時は、最も古いエントリから自動破棄（DropOldest 循環）する。
+  - バッファ上限（MinimumRetainedEntryCount）超過時は、最も古いエントリから自動破棄（DropOldest 循環）する。
 - 書き込みはロックフリー指向の設計とする。ただし初期フェーズでは厳密なロックフリーは必須としない（テスト整備後に最適化する）。
   - `ILogger.Log` は `System.Threading.Channels` の `TryWrite`（待機を伴わない書き込み）を用い、呼び出し元スレッドを待機でブロックしない。
   - 初期フェーズでは実装コストと安全性を優先し、内部バッファ（Channel）経由の単一 Consumer 集約パイプライン構成とする。
@@ -65,8 +65,8 @@ Second
 ### 責務境界とメモリライフサイクル
 
 - **LiveLogPipeline の責務**:
-  - インメモリバッファの容量（MaxCapacity = N）を厳密に保証し、超過時は DropOldest で自動破棄する。
-  - 外部への Push 通知は Delta 配信に従って安全にディスパッチし、LiveLogPipeline 内部のメモリ量を、ログ流量に依存せず設定上限（MaxCapacity・Channel 容量・バッチ上限）で一定に保つ。
+  - インメモリバッファの容量（MinimumRetainedEntryCount = N）を最低容量として保証し、超過時は DropOldest で自動破棄する。
+  - 外部への Push 通知は Delta 配信に従って安全にディスパッチし、LiveLogPipeline 内部のメモリ量を、ログ流量に依存せず設定上限（MinimumRetainedEntryCount・Channel 容量・バッチ上限）で一定に保つ。
   - 「低アロケーション」の対象は配信側（バッチ・Fast パス）とする。Producer 側の `Message` フォーマットによる割り当ては避けられない。また `Exception` への参照はバッファ内で保持される。
 - **UI / Consumer の責務**:
   - UI 側の表示リスト（`ObservableCollection` 等）の肥大化を防ぐため、UI 側での最大表示件数の制御は ViewModel / UI 側の責務とする。
@@ -118,8 +118,8 @@ public interface ILiveLogPipeline : IDisposable
     /// <summary>現在バッファ内に保持されている有効なログ件数を取得します。</summary>
     int Count { get; }
 
-    /// <summary>バッファの最大保持可能件数（Capacity）を取得します。</summary>
-    int Capacity { get; }
+    /// <summary>バッファの最大保持可能件数（MinimumRetainedEntryCount）を取得します。</summary>
+    int MinimumRetainedEntryCount { get; }
 
     // =========================================================================
     // Push 型（リアルタイム配信）
@@ -197,10 +197,10 @@ public sealed class LiveLogOptions
     // =========================================================================
 
     /// <summary>
-    /// インメモリに保持する最大ログ件数（デフォルト: 1000）。
+    /// インメモリに保持する最低保証ログ件数（デフォルト: 1024）。
     /// 上限超過時は DropOldest（最も古いログから自動破棄）されます。
     /// </summary>
-    public int MaxCapacity { get; set; } = 1000;
+    public int MinimumRetainedEntryCount { get; set; } = 1024;
 
     // =========================================================================
     // 2. バッチ・フラッシュ
@@ -326,7 +326,7 @@ flowchart TD
 
 - **AsyncLocal の限界**: 同一 UI スレッド上で複数の Window / Tab が並存すると、後から生成したスコープの値が先のスコープのイベントハンドラ由来のログにも適用され、非 LIFO 順の Dispose で復元も崩れる。WPF の複数 Tab での動作を最優先で検証し、不十分なら `BeginScope` ベースまたは明示指定（ファクトリ経由の Logger）へ切り替える。
 - **登録と生成**: `AddLiveLogPipeline` が登録する対象（Provider、Root パイプライン、Worker は `IHostedService`）と Scoped パイプラインの生成手段（DI スコープ / ファクトリ）、Scoped 個別の Options の要否。ホスト起動前のログは Channel に溜める。
-- **Channel**: 初期実装は容量 100・`DropOldest` とする。Consumer が追いつかない場合は未処理の古いログが失われ、継続的な過負荷では欠落が続く。SequenceId は dequeue 後に採番するため、Channel で捨てられた件数は ID の欠番からは分からない。容量の設定項目、`MaxCapacity` との関係、欠落件数カウンタの公開要否は OPT として検討する。アプリ終了時は未処理分を破棄してよい。
+- **Channel**: 初期実装は容量 100・`DropOldest` とする。Consumer が追いつかない場合は未処理の古いログが失われ、継続的な過負荷では欠落が続く。SequenceId は dequeue 後に採番するため、Channel で捨てられた件数は ID の欠番からは分からない。容量の設定項目、`MinimumRetainedEntryCount` との関係、欠落件数カウンタの公開要否は OPT として検討する。アプリ終了時は未処理分を破棄してよい。
 - **設定バインド**: appsettings.json セクションへのバインド方法と、`AddFilter<T>` に使う Provider 型 / エイリアス名。`IncludedEventIds` は `EventId.Id` のみで判定する。
 - **内部型**: Channel 用の内部ラッパー（ScopeId 付き、SequenceId 未採番）。
 - **その他**: `ILiveLogPipeline.Dispose` を Root に公開してよいか（Scoped のみに持たせる案あり）、`ManagedThreadId` は Producer スレッドで取得する、Safe パスの配列は購読者がいない場合は生成しない。
