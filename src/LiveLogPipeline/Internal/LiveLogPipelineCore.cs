@@ -12,15 +12,39 @@ internal sealed class LiveLogPipelineCore : ILiveLogPipeline, IDisposable
     private readonly int _capacity;
     private readonly int _mask;
     private int _top;
-    public LiveLogPipelineCore(IOptions<LiveLogPipelineOptions> options)
+
+    private readonly TimeSpan _flushInterval;
+    private readonly int _maxBatchSize;
+
+    private readonly LogEntry[] _pendingLogEntries;
+    private int _pendingLogEntriesCount;
+    private bool _isTimerRunning;
+    private readonly ITimer _flushTimer;
+    private bool _isDisposed;
+
+    public LiveLogPipelineCore(IOptions<LiveLogPipelineOptions> options, TimeProvider timerProvider)
     {
         _lock = new Lock();
+
         _capacity = RoundUpToPowerOfTwo(options.Value.MinimumRetainedEntryCount);
         _mask = _capacity - 1;
         _top = 0;
         _buffer = new LogEntry[_capacity];
         _count = 0;
+
+        _flushInterval = options.Value.FlushInterval;
+        _maxBatchSize = options.Value.MaxBatchSize;
+
+        _pendingLogEntries = new LogEntry[_maxBatchSize];
+        _pendingLogEntriesCount = 0;
+        _isTimerRunning = false;
+        _flushTimer = timerProvider.CreateTimer(
+            FlushCallback,
+            this,
+            Timeout.InfiniteTimeSpan,
+            Timeout.InfiniteTimeSpan);
     }
+
     public int Count
     {
         get
@@ -39,7 +63,21 @@ internal sealed class LiveLogPipelineCore : ILiveLogPipeline, IDisposable
 
     public void Dispose()
     {
-        // Dispose resources if any
+        lock (_lock)
+        {
+            if (_isDisposed)
+            {
+                return;
+            }
+            _isDisposed = true;
+
+            if (_isTimerRunning)
+            {
+                _ = _flushTimer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+                _isTimerRunning = false;
+            }
+            _flushTimer.Dispose();
+        }
     }
 
     public LogEntry[] GetSnapshot()
@@ -97,6 +135,11 @@ internal sealed class LiveLogPipelineCore : ILiveLogPipeline, IDisposable
         // OPT: consider SeqLock for single-writer and multiple-reader scenarios to reduce locking overhead
         lock (_lock)
         {
+            if (_isDisposed)
+            {
+                return;
+            }
+
             _buffer[_top] = logEntry;
             if (_count < _capacity)
             {
@@ -104,7 +147,96 @@ internal sealed class LiveLogPipelineCore : ILiveLogPipeline, IDisposable
             }
             _top++;
             _top &= _mask;
+
+            if (!_isTimerRunning)
+            {
+                _ = _flushTimer.Change(_flushInterval, Timeout.InfiniteTimeSpan);
+                _isTimerRunning = true;
+            }
+            _pendingLogEntries[_pendingLogEntriesCount] = logEntry;
+            _pendingLogEntriesCount++;
+            if (_pendingLogEntriesCount == _maxBatchSize)
+            {
+                FlushLocked();
+            }
         }
+    }
+
+    private void FlushCallback(object? _)
+    {
+        lock (_lock)
+        {
+            if (_isDisposed)
+            {
+                return;
+            }
+
+            FlushLocked();
+        }
+    }
+
+    private void FlushLocked()
+    {
+        if (_isTimerRunning)
+        {
+            _ = _flushTimer.Change(Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+            _isTimerRunning = false;
+        }
+
+        var batch = DrainPendingBatchLocked();
+        if (batch is not null)
+        {
+            InvokeSafeHandlers(batch);
+        }
+    }
+
+    private void InvokeSafeHandlers(LogEntry[] batch)
+    {
+        Action<LogBatchEventArgs>? handler = LogBatchReceived;
+        if (handler is null)
+        {
+            return;
+        }
+
+        var args = new LogBatchEventArgs(batch);
+
+        // .NET 9++ optimization
+        if (handler.HasSingleTarget)
+        {
+            try
+            {
+                handler(args);
+            }
+            catch { }
+            return;
+        }
+
+        foreach (Delegate subscriber in handler.GetInvocationList())
+        {
+            try
+            {
+                ((Action<LogBatchEventArgs>)subscriber).Invoke(args);
+            }
+            catch { }
+        }
+    }
+    private LogEntry[]? DrainPendingBatchLocked()
+    {
+        if (_pendingLogEntriesCount == 0)
+        {
+            return null;
+        }
+
+        if (LogBatchReceived is null)
+        {
+            Array.Clear(_pendingLogEntries, 0, _pendingLogEntriesCount);
+            _pendingLogEntriesCount = 0;
+            return null;
+        }
+
+        var batch = _pendingLogEntries[.._pendingLogEntriesCount].ToArray();
+        _pendingLogEntriesCount = 0;
+        return batch;
     }
     
     private static int RoundUpToPowerOfTwo(int capacity)

@@ -18,6 +18,7 @@ public static class LiveLogPipelineBuilderExtensions
         builder.Services.TryAddSingleton<ILiveLogPipeline>(provider => provider.GetRequiredService<LiveLogPipelineCore>());
         builder.Services.TryAddSingleton<LiveLogRouter>();
         builder.Services.TryAddEnumerable(ServiceDescriptor.Singleton<ILoggerProvider, LiveLogLoggerProvider>());
+        builder.Services.TryAddSingleton(TimeProvider.System);
         
         // Register the provider options for LiveLogLoggerProvider
         LoggerProviderOptions.RegisterProviderOptions<LiveLogPipelineOptions, LiveLogLoggerProvider>(builder.Services);
